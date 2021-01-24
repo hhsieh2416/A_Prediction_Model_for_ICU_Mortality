@@ -1,0 +1,397 @@
+---
+title: "A Clinical Prediction Model for ICU Mortality"
+author: "Han-Yu Hsieh"
+date: "24/01/2021"
+output: 
+ html_document:
+   df_print: paged
+---
+# 1. Introduction
+The objective is to build a prediction model for identifying patients who are likely to die during their ICU stay, and I also focus on doing some illustrative data visualization for various predictors along the way. The source of the data comes from MIMIC-III, a freely accessible critical care database - Johnson, A. E. W. et al. Sci. Data 3:160035 doi: 10.1038/sdata.2016.35 (2016). I am new to machine learning and hoping to learn more, so any feedback is very welcome.
+ 
+ There are three parts to my script as follows:  
+- Feature engineering  
+- Missing value imputation  
+- Prediction
+
+## 1.1 Load and check data
+```{r setup}
+knitr::opts_chunk$set(message= FALSE, echo = TRUE, cache=TRUE, warning=FALSE)
+```
+
+```{css, echo=FALSE}
+.scroll-100 {
+  max-height: 100px;
+  overflow-y: auto;
+  background-color: inherit;
+}
+```
+
+```{r}
+#Load packages
+library(tidyverse) # data wrangling and visualization
+library(bigrquery) # connecting to BigQuery database
+library(magrittr) # piping data and analysis chains
+library(ggplot2) # data visualization
+library(rsample) # data sampling 
+library(plotROC) # data visualization
+library(kableExtra) # data wrangling
+library(mice) # imputation
+library(randomForest) # classification algorithm
+```
+
+It is also the course project for Predictive Modeling and Transforming Clinical Practice in Coursera by Dr. Laura K Wiley, and I downloaded the data from Google BigQuery.
+```{r results='hide'}
+options(gargle_oauth_email = "mickey03052416@gmail.com")
+con <- DBI::dbConnect(drv = bigquery(),
+                      project = "learnclinicaldatascience")
+                      
+admissions <- tbl(con, 'mimic3_demo.ADMISSIONS') %>% 
+  collect()
+patients <- tbl(con, 'mimic3_demo.PATIENTS') %>% 
+  collect()
+icustays <- tbl(con, "mimic3_demo.ICUSTAYS") %>% 
+  collect()
+chartevents <- tbl(con, "mimic3_demo.CHARTEVENTS") %>% 
+  collect()
+d_items <- tbl(con, "mimic3_demo.D_ITEMS") %>% 
+  collect()
+labevents <- tbl(con, "mimic3_demo.LABEVENTS") %>% 
+  collect()
+d_labitems <- tbl(con, "mimic3_demo.D_LABITEMS") %>% 
+  collect()
+```
+Check https://mimic.physionet.org/gettingstarted/demo/ for the detailed description for each table. 
+
+```{r, class.output="scroll-100"}
+str(icustays)
+```
+I know that the data set only contains 100 patients but there are 136 entries in icustays table, which means that some patients have multiple ICU stays. Let's take a look.
+```{r}
+first_ICU_stay <- icustays %>%
+  left_join(admissions, by = c("SUBJECT_ID" = "SUBJECT_ID", "HADM_ID" = "HADM_ID")) %>%
+  group_by(SUBJECT_ID) %>% 
+  filter(INTIME == min(INTIME)) %>% 
+  ungroup() %>%
+  select(SUBJECT_ID, HADM_ID, ICUSTAY_ID, INTIME, LOS, DIAGNOSIS, HOSPITAL_EXPIRE_FLAG) 
+last_ICU_stay <- icustays %>%
+  left_join(admissions, by = c("SUBJECT_ID" = "SUBJECT_ID", "HADM_ID" = "HADM_ID")) %>%
+  group_by(SUBJECT_ID) %>% 
+  filter(INTIME == max(INTIME)) %>% 
+  ungroup() %>%
+  select(SUBJECT_ID, HADM_ID, ICUSTAY_ID, INTIME,LOS, DIAGNOSIS, HOSPITAL_EXPIRE_FLAG) 
+
+t1 <- first_ICU_stay %>% filter(HOSPITAL_EXPIRE_FLAG == 1) %>% count()
+t2 <- last_ICU_stay %>% filter(HOSPITAL_EXPIRE_FLAG == 1) %>% count()
+kable(list(t1, t2)) %>% kable_styling()
+```
+During the first ICU stay, 33 patients did not survive, and the number for the last ICU stay is 40. I am going to use the last ICU stay table as the data frame to do exploratory data analysis and build a prediction model.
+
+# 2. Feature Engineering
+```{r, class.output="scroll-100"}
+str(chartevents)
+str(labevents)
+```
+As we can see, there are a total of 758,355 chart events and 76,074 lab events during the 136 entries in icustays table. Without any guidance, selecting the variables is no doubt like finding a needle in the haystack.   Therefore, I referred to two research articles to guide me in selecting meaningful variables.  
+-Reference A: https://journals.sagepub.com/doi/pdf/10.1177/1473230009037005  
+-Reference B: https://healthpolicy.ucsf.edu/icu-outcomes#RESULTS
+
+## 2.1 Diagnosis
+Inspired by Reference B, I summarizes all kind of diagnosis to 5 categories - ACUTE, ACUTE CARDIAC, CANCER, CHRONIC, INFECTION, and do exploratory data analysis for diagnosis type.
+```{r}
+#Diagnosis Type
+last_ICU_stay <- last_ICU_stay %>% mutate(diagnosis_type = case_when(
+  grepl("(.)*CANCER|(.) CA|(.)*LEUKEMIA", DIAGNOSIS, ignore.case = TRUE) ~ "CANCER",
+  grepl("(.)*SEPSIS|INFECTION|CHOLANGITIS|ABSCESS|FEVER|PNEUMONIA", DIAGNOSIS, ignore.case = TRUE) ~ "INFECTION",
+  grepl("(.)*MI|VF ARREST|STROKE(.)*|CHEST PAIN|MYOCARDIAL", DIAGNOSIS, ignore.case = TRUE) ~ "ACUTE CARDIAC",
+  grepl("(.)*ACCIDENT|FRACTURE|(.)*FALL|SEIZURE|BREATH|BLEED|HEMATOMA|OVERDOSE|SYNCOPE(.)*|TACHYPNEA|ACUTE",DIAGNOSIS, ignore.case = TRUE) ~ "ACUTE",
+  grepl("(.)*PULMONARY|RESPIRATORY|LUNG|ASTHMA|LIVER|HEPATI(TIS|IC)|ESOPHAGEAL|OA|ARTHRITIS|(HYPO|HYPER)TENSION|HEADACHE|DISTRESS|MENTAL|HEAD|ANGINA|BRAIN|HEART FAILURE|(.)*EFFUSION|FAILURE TO THRIVE|"
+        , DIAGNOSIS, ignore.case = TRUE) ~ "CHRONIC", TRUE ~ "OTHERS"))
+```
+
+```{r figures-side, fig.show="hold", out.width="50%"}
+ggplot(last_ICU_stay, aes(x=diagnosis_type, fill = factor(HOSPITAL_EXPIRE_FLAG)))+
+  geom_bar(stat = "count", position = "dodge")+
+  theme_bw()+
+  theme(axis.text.x = element_text(size = 8, angle = 90))+ 
+  labs(x= "Diagnosis Type", y="Case Counts", title = "Diagnosis Type Case Counts")+
+  scale_y_continuous(breaks = c(0,1,2,3,4,5,8,12))+
+  scale_fill_discrete(name="Death", labels=c("0 (n=60)","1 (n=40)"))
+mosaicplot(table(last_ICU_stay$diagnosis_type, last_ICU_stay$HOSPITAL_EXPIRE_FLAG),
+        main = "Diagnosis Type by Death 1", shade = TRUE, las = 2)
+```
+
+## 2.2 Ventilator Usage and Deep Stupor
+From Reference B, ventilation usage and coma status have a significant impact on Intensive Care Outcomes. So I would like to make two new variables to the last_ICU_STAY table- the hours on ventilation and minimum GCS during the ICU stay from the chartevents table.
+```{r class.output="scroll-100"}
+#the length of ventilator usage
+ventilator_label <- d_items %>% 
+  filter(str_detect(LABEL, pattern = regex("ventilator", ignore_case = TRUE))) %>%
+  select(ITEMID)
+ventilator_label <- data.matrix(sapply(ventilator_label, as.numeric))
+duration_on_ventilator <- chartevents %>%
+  filter(ITEMID %in% ventilator_label) %>%
+  group_by(SUBJECT_ID, HADM_ID, ICUSTAY_ID) %>%
+  summarise(sec_on_ventilator = max(STORETIME, na.rm = T) - min(STORETIME, na.rm = T)) 
+last_ICU_stay <- last_ICU_stay %>%
+  left_join(duration_on_ventilator)
+str(last_ICU_stay)
+```
+For those who has NA for sec_on_ventilator, it suggests that these patients very likely was not on a ventilator during their ICU stay. However, it is also possible that some of these patients had missing values in this variable. I am going to convert NA to 0 and treat it as no ventilator usage during the stay as well as converting seconds to hours as the unit.
+```{r, fig.show="hold", out.width="50%"}
+library(stringr)
+regexp <- "[[:digit:]]+"
+last_ICU_stay$sec_on_ventilator <- as.numeric(str_extract(
+  last_ICU_stay$sec_on_ventilator, regexp)) 
+last_ICU_stay <- last_ICU_stay %>%
+  mutate(hr_on_ventilator = sec_on_ventilator/3600) 
+last_ICU_stay[is.na(last_ICU_stay$hr_on_ventilator), 10] <- 0
+
+#Minimum GCS during the ICU stay
+GSC_label <- d_items %>% 
+  filter(str_detect(LABEL, pattern = regex("GCS", ignore_case = TRUE))) %>%
+  select(ITEMID)
+GSC_label <- data.matrix(sapply(GSC_label, as.numeric))
+total_GCS <- chartevents %>%
+  filter(ITEMID %in% GSC_label) %>%
+  group_by(SUBJECT_ID, HADM_ID, ICUSTAY_ID, CHARTTIME) %>%
+  summarise(total_GCS = sum(VALUENUM)) 
+min_GCS <- last_ICU_stay %>%
+  left_join(total_GCS, by = c("SUBJECT_ID", "HADM_ID", "ICUSTAY_ID")) %>%
+  select(SUBJECT_ID, HOSPITAL_EXPIRE_FLAG, total_GCS) %>%
+  group_by(SUBJECT_ID) %>%
+  summarise(min_GCS = min(total_GCS, na.rm = T))
+last_ICU_stay <- last_ICU_stay %>%
+  left_join(min_GCS)
+last_ICU_stay %>% filter(is.infinite(last_ICU_stay$min_GCS))
+#There are 3 patients, who don't have a minimum GCS and ventilator usage record. I will discuss this later.
+
+ggplot(last_ICU_stay, aes(x= as.character(HOSPITAL_EXPIRE_FLAG), 
+                          y= hr_on_ventilator,
+                          fill = factor(HOSPITAL_EXPIRE_FLAG)))+
+  geom_boxplot(position = "dodge")+ theme_bw()+
+  labs(x= "Death", y="On Ventilator(hours)", 
+       title = "The Hours of Ventilator Usage During the ICU Stay")+
+  scale_fill_discrete(name="Death", labels=c("0 (n=59)","1 (n=38)"))
+
+ggplot(last_ICU_stay, aes(x= as.character(HOSPITAL_EXPIRE_FLAG), 
+                          y= min_GCS,
+                          fill = factor(HOSPITAL_EXPIRE_FLAG)))+
+  geom_boxplot(position = "dodge")+ theme_bw()+
+  labs(x= "Death", y="Minimum GCS During the ICU Stay", 
+       title = "The Minimum GCS During the ICU Stay")+
+  scale_fill_discrete(name="Death", labels=c("0 (n=59)","1 (n=38)"))
+```
+
+## 2.3 Heart Rate and Blood Pressure during the ICU Stay
+From Reference B, predictors like heart rate >= 150 and systolic blood pressure <= 90 have P-value < 0.001 in terms of ICU mortality. Therefore, I would like to find out the maximum heart rate and lowest blood pressure during the ICU stay from the chartevents table since I believe they are good predictors for my model building.
+```{r, class.output="scroll-100"}
+#Maximum heart rate
+d_items %>%
+  filter(str_detect(LABEL, pattern =  regex("heart rate", ignore_case = TRUE))) %>%
+  print()
+heart_rate <- chartevents %>%
+  filter(ITEMID %in% c(211, 220045)) %>%
+  select(SUBJECT_ID, HADM_ID, ICUSTAY_ID, CHARTTIME, VALUENUM) %>%
+  group_by(SUBJECT_ID, HADM_ID, ICUSTAY_ID) %>%
+  summarise(max_heart_rate = max(VALUENUM, na.rm = TRUE)) 
+#Lowest blood pressure
+d_items %>%
+  filter(str_detect(LABEL, pattern =  regex("diastolic(blood pressure)?|NBP|Arterial BP", ignore_case = TRUE))) %>%
+  print()
+blood_pressure <- chartevents %>%
+  filter(ITEMID %in% c(227242, 224643, 220180, 220051,455, 8441, 5817, 8551, 8368)) %>%
+  select(SUBJECT_ID, HADM_ID, ICUSTAY_ID, CHARTTIME, VALUENUM) %>%
+  group_by(SUBJECT_ID, HADM_ID, ICUSTAY_ID) %>%
+  summarise(min_blood_pressure = min(VALUENUM, na.rm = TRUE))
+last_ICU_stay <- last_ICU_stay %>%
+  left_join(heart_rate, by = c("SUBJECT_ID", "HADM_ID", "ICUSTAY_ID")) %>%
+  left_join(blood_pressure, by = c("SUBJECT_ID", "HADM_ID", "ICUSTAY_ID"))
+last_ICU_stay %>% filter(is.na(last_ICU_stay$max_heart_rate))
+```
+Patient ID 10067,10120, 41976 not only does not have ventilator usage and GCS data but also heart rate and blood pressure data, which I will discuss later.
+```{r fig.show="hold", out.width="50%"}
+ggplot(last_ICU_stay, aes(x= as.character(HOSPITAL_EXPIRE_FLAG), 
+                                     y= max_heart_rate,
+                                     fill = factor(HOSPITAL_EXPIRE_FLAG)))+
+  geom_boxplot(position = "dodge")+ theme_bw()+
+  labs(x= "Death", y="Heart Rate(BPM)", 
+       title = "Maximum Heart Rate During the ICU Stay")+
+  scale_fill_discrete(name="Death", labels=c("0 (n=59)","1 (n=38)"))
+
+ggplot(last_ICU_stay, aes(x= as.character(HOSPITAL_EXPIRE_FLAG), 
+                                     y= min_blood_pressure,
+                                     fill = factor(HOSPITAL_EXPIRE_FLAG)))+
+  geom_boxplot(position = "dodge")+ theme_bw()+
+  labs(x= "Death", y="Blood Pressure(mmHg)", 
+       title = "Lowest Blood Pressure During the ICU Stay")+
+  scale_fill_discrete(name="Death", labels=c("0 (n=59)","1 (n=38)"))
+```
+
+## 2.4 Lowest Blood Glucose During the Hospital Admission and the Length of ICU Stay
+From Reference A, it indicates BG >= 80mg/dl were relevant for survival, so I think it is g good idea to check blood glucose as a predictor. Also, inspired by Reference B, I am interested in knowing whether the length of ICU stay is relevant for survival. Let's take a look.
+```{r class.output="scroll-100"}
+#Lowest Blood Glucose
+d_labitems %>%
+  filter(str_detect(LABEL, pattern =  regex("Glucose", ignore_case = TRUE))) %>%
+  print()
+min_BG<- labevents %>%
+  filter(ITEMID %in% c(50809, 50931)) %>%
+  group_by(SUBJECT_ID, HADM_ID) %>%
+  summarise(min_BG = min(VALUENUM, na.rm = T))
+last_ICU_stay <- last_ICU_stay %>%
+  left_join(min_BG, by=c("SUBJECT_ID", "HADM_ID"))
+#the length of ICU stay
+last_ICU_stay %>% group_by(HOSPITAL_EXPIRE_FLAG) %>%
+  summarise(mean=mean(LOS))
+```
+
+```{r, fig.show="hold", out.width="50%"}
+ggplot(last_ICU_stay, aes(x= as.character(HOSPITAL_EXPIRE_FLAG), 
+                          y= min_BG,
+                          fill = factor(HOSPITAL_EXPIRE_FLAG)))+
+  geom_boxplot(position = "dodge")+ theme_bw()+
+  labs(x= "Death", y="Blood Glucose(mg/dL)", 
+       title = "Lowest Blood Glucose During the Hospital Admission")+
+  scale_fill_discrete(name="Death", labels=c("0 (n=60)","1 (n=40)"))
+ggplot(last_ICU_stay, aes(x= as.character(HOSPITAL_EXPIRE_FLAG), 
+                          y= LOS,
+                          fill = factor(HOSPITAL_EXPIRE_FLAG)))+
+  geom_boxplot(position = "dodge")+ theme_bw()+
+  labs(x= "Death", y="Days", 
+       title = "The Length of ICU Stay")+
+  scale_fill_discrete(name="Death", labels=c("0 (n=60)","1 (n=40)"))+
+  annotate("text", x=1, y=40, label="average 3.85 days in ICU ")+
+  annotate("text", x=2, y=40, label="average 6.19 days in ICU ")
+```
+
+## 2.5 Gender and Age 
+From both references, they do not mention gender as a factor for impacting ICU outcome. As for the age variable, the coefficient with ICU mortality and the length of ICU stay is significant in Reference B. Let's check these two variables. 
+```{r, class.output="scroll-100"}
+#Gender
+gender <- patients %>%
+  select(SUBJECT_ID, GENDER) %>%
+  mutate(male = case_when(GENDER == "M"  ~1,
+                          TRUE ~0)) %>%
+  right_join(last_ICU_stay) %>%
+  select(SUBJECT_ID, HADM_ID, ICUSTAY_ID, male, HOSPITAL_EXPIRE_FLAG)
+#Age
+date_of_birth <- patients %>%
+  select(SUBJECT_ID, DOB) %>%
+  right_join(last_ICU_stay) %>%
+  mutate(age_intake_ICU = round(as.numeric(INTIME - DOB)/365.25))%>%
+  select(SUBJECT_ID, HADM_ID, ICUSTAY_ID, age_intake_ICU, HOSPITAL_EXPIRE_FLAG)
+table(is.na(date_of_birth$age_intake_ICU))
+#there are 8 patients who didn't have DOB in patients table.
+last_ICU_stay <- last_ICU_stay %>%
+  left_join(gender) %>%
+  left_join(date_of_birth)
+#I am going to create a model predicting ages based on other variables.
+#using mice package for this task
+analysis_data <- last_ICU_stay
+#Imputing Age
+factor_vars <- c('LOS','diagnosis_type',"hr_on_ventilator", "min_GCS", "max_heart_rate"
+                 , "min_blood_pressure", "min_BG", "male")
+last_ICU_stay[factor_vars] <- lapply(last_ICU_stay[factor_vars], function(x) as.factor(x))
+set.seed(20210116)
+mice_mod <- mice(last_ICU_stay[, !names(last_ICU_stay) %in% c('SUBJECT_ID', 
+            'HADM_ID', 'ICUSTAY_ID', 'INTIME', 'HOSPITAL_EXPIRE_FLAG', 'sec_on_ventilator')], method='rf')
+mice_output <- complete(mice_mod)
+#plot age distributions
+par(mfrow=c(1,2))
+hist(last_ICU_stay$age_intake_ICU, freq = F, main = "Age: Original Data",
+     col = 'darkgreen', ylim = c(0, 0.04))
+hist(mice_output$age_intake_ICU, freq = F, main = "Age: MICE Output",
+     col = 'lightgreen', ylim = c(0, 0.04))
+#The imputing looks good, and I am going to replace the age vector in the original data.
+analysis_data$age_intake_ICU <- mice_output$age_intake_ICU
+```
+
+## 3. Missingness
+```{r}
+analysis_data %>% filter(is.na(analysis_data$max_heart_rate))
+```
+Patient 10067,10120, 41976 does not have ventilator usage, GCS, heart rate, blood pressure record. Due to the lack of many variables, I decide to delete these 3 patients entirely and use the 97 entries as analytic data to build a prediction model.
+```{r}
+analysis_data <- analysis_data[!is.na(analysis_data$max_heart_rate), ]
+analysis_data
+```
+
+## 4. Prediction
+At last, I'm ready to build a prediction model to identify who survives during the ICU stay based on variables that I carefully curated and treated for missing values. For this, I will rely on the Binomial Regression Model and RandomForest classification algorithm. Then I will evaluate the two prediction models.  
+## 4.1 Regression Model
+```{r class.output="scroll-100" }
+set.seed(2021)
+data_split <- initial_split(analysis_data, prop = 7/10)
+training_data <- training(data_split)
+testing_data <- testing(data_split)
+model_bin <- training_data %>%
+  glm(formula = HOSPITAL_EXPIRE_FLAG ~ LOS+diagnosis_type+hr_on_ventilator+min_GCS
+      +max_heart_rate+min_blood_pressure+min_BG+male+age_intake_ICU,
+      family = 'binomial')
+summary(model_bin)
+
+training_data$predicted_outcome <- predict(model_bin, training_data,
+                                           type = "response")
+training_roc <- training_data %>%
+  ggplot(aes(m= predicted_outcome, d=HOSPITAL_EXPIRE_FLAG))+
+  labs(title = "ROC Plot for Training Data")+
+  geom_roc(n.cuts = 10, labels = F, labelround = 4)+
+  style_roc(theme = theme_grey)
+calc_auc(training_roc)$AUC*100
+```
+The Binomial model has an AUC of 93.02% in training data, which is surprisingly good, and I hope the AUC in testing data will stay the same. 
+```{r}
+#Quantitative Validation
+testing_data$predicted_outcome <- predict(model_bin, testing_data,
+                                        type = "response")
+testing_roc <- testing_data %>%
+  ggplot(aes(m= predicted_outcome, d= HOSPITAL_EXPIRE_FLAG))+
+  labs(title = "ROC Plot for Testing Data")+
+  geom_roc(n.cuts = 10, labels = F, labelround = 4) +
+  style_roc(theme = theme_grey)
+calc_auc(testing_roc)$AUC*100
+```
+```{r fig.show="hold", out.width="50%"}
+training_roc
+testing_roc
+```
+As we can see, the performance of this model got significantly worse in the testing_data. An AUC of 68.3% is quite poor - because an AUC of 50% means the model is unable to distinguish between the two outcomes. Therefore, the Binomial Model is not ideal. Let's move on to RandomForest classification model building.
+
+## 4.2 RandomForest
+```{r}
+set.seed(20210117)
+model_rf <- randomForest(factor(HOSPITAL_EXPIRE_FLAG) ~ LOS+diagnosis_type
+                         +hr_on_ventilator+min_GCS+max_heart_rate
+                         +min_blood_pressure+min_BG+male+age_intake_ICU,
+                          data = analysis_data, na.action = na.exclude)
+print(model_rf)
+#The model error
+par(mfrow=c(1,1))
+plot(model_rf, ylim=c(0,0.55))
+legend("bottomleft", colnames(model_rf$err.rate), col = 1:3, fill = 1:3)
+```
+
+The black line shows the overall out-of-bag error rate which falls around 21.6%. The red and green lines show the error rate for ‘survived’ and ‘died’ respectively. We can see that right now I'm much more successful in predicting survival than death. I believe it is strongly related to the variable selection. Let’s look at relative variable importance by plotting the mean decrease in Gini calculated across all trees.
+```{r}
+#Variable importance
+importance <- importance(model_rf)
+varImprtance <- data.frame(variables = row.names(importance), 
+                           Importance = round(importance[, 'MeanDecreaseGini'], 2))
+rankImportance <- varImprtance %>%
+  mutate(Rank = paste0('#', dense_rank(desc(Importance))))
+  
+ggplot(rankImportance, aes(x= reorder(variables, Importance),
+                           y = Importance, fill= Importance))+
+  geom_bar(stat = 'identity') +
+  geom_text(aes(x= variables, y=0.5, label = Rank),
+            hjust=0, vjust=0.55, size=4, color='red')+
+  labs(x='Variables')+
+  coord_flip()+
+  theme_bw()
+```
+
+The minimum GCS, the minimum blood pressure and the minimum blood glucose are the top three highest relative importance out of all the predictor variables. I am not surprised to see the gender is the least relevant variable since both references do not indicate it as an important variable. 
+
+## 5. Conclusion
+By referencing two ICU outcome retrospective studies, I identified 9 variables from 758 thousands of chat events and 76 thousands of lab events and built a RamdomForest Model to predict who survives during the ICU stay with a 21.6% OOB error rate. As a beginner in Machine Learning, I am happy with the algorithm and look forward to doing more.
